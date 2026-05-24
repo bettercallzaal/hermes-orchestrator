@@ -1,0 +1,64 @@
+{
+  "name": "hermes-orchestrator",
+  "version": "0.1.0",
+  "description": "Supervisor framework for AI agents - classify, spawn, watch, intervene, learn. The Hermes pattern (Claude CLI subprocess) generalised.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./adapters/hermes-runner": {
+      "types": "./dist/adapters/hermes-runner.d.ts",
+      "import": "./dist/adapters/hermes-runner.js"
+    },
+    "./adapters/bonfire-memory": {
+      "types": "./dist/adapters/bonfire-memory.d.ts",
+      "import": "./dist/adapters/bonfire-memory.js"
+    },
+    "./patterns/hermes-bug-fix": {
+      "types": "./dist/patterns/hermes-bug-fix.d.ts",
+      "import": "./dist/patterns/hermes-bug-fix.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE", "docs"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "claude",
+    "anthropic",
+    "supervisor",
+    "orchestrator",
+    "hermes",
+    "bonfires",
+    "knowledge-graph",
+    "agent-builder"
+  ],
+  "author": "Zaal Panthaki <zaal@thezao.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bettercallzaal/hermes-orchestrator.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bettercallzaal/hermes-orchestrator/issues"
+  },
+  "homepage": "https://github.com/bettercallzaal/hermes-orchestrator#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

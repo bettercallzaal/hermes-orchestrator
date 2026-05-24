@@ -12,7 +12,13 @@ import type {
   ChannelAdapter,
 } from '../src/types.js'
 
-function fakeRunner(events: RunEvent[]): RunnerAdapter {
+function fakeRunner(
+  events: RunEvent[],
+  hooks?: {
+    intervene?: (handle: RunHandle, message: string) => Promise<void>
+    kill?: (handle: RunHandle) => Promise<void>
+  },
+): RunnerAdapter {
   return {
     name: 'fake',
     async spawn(_input: RunnerInput): Promise<RunHandle> {
@@ -30,8 +36,12 @@ function fakeRunner(events: RunEvent[]): RunnerAdapter {
         yield e
       }
     },
-    async intervene() {},
-    async kill() {},
+    async intervene(handle: RunHandle, message: string) {
+      if (hooks?.intervene) await hooks.intervene(handle, message)
+    },
+    async kill(handle: RunHandle) {
+      if (hooks?.kill) await hooks.kill(handle)
+    },
   }
 }
 
@@ -177,5 +187,108 @@ describe('orchestrate (end to end with fake adapters)', () => {
     const kinds = memory.recorded.map((e) => e.kind)
     expect(kinds).toContain('gated')
     expect(kinds).not.toContain('spawned')
+  })
+
+  it('PR3: calls runner.intervene on loop-detected verdict with acted=true', async () => {
+    const msg = 'I am stuck on this'
+    const interveneFn = vi.fn(async () => {})
+    const runner = fakeRunner(
+      [
+        { type: 'message', role: 'assistant', content: msg },
+        { type: 'message', role: 'assistant', content: msg },
+        { type: 'message', role: 'assistant', content: msg },
+        { type: 'complete', summary: 'eventually done', costUsd: 0.05 },
+      ],
+      { intervene: interveneFn },
+    )
+    const memory = fakeMemory()
+
+    const outcome = await orchestrate('fix the bug in src/foo.ts', {
+      runner,
+      memory,
+      patterns: [hermesBugFix],
+      stuckTimeoutMs: 0, // disable stuck-timeout race for this test
+    })
+
+    expect(interveneFn).toHaveBeenCalledTimes(1)
+    expect(interveneFn.mock.calls[0][1]).toMatch(/Supervisor:/)
+    expect(outcome.interventions.length).toBe(1)
+    expect(outcome.interventions[0].reason).toMatch(/loop detected/)
+
+    const intervenedEvent = memory.recorded.find((e) => e.kind === 'intervened')
+    expect(intervenedEvent).toBeDefined()
+    expect(intervenedEvent?.payload.acted).toBe(true)
+  })
+
+  it('PR3: stuck-timeout fires when the stream goes quiet (orchestrator-level race)', async () => {
+    const interveneFn = vi.fn(async () => {})
+    // Runner that yields nothing and never finishes within the test window.
+    const runner: RunnerAdapter = {
+      name: 'silent',
+      async spawn(_input: RunnerInput): Promise<RunHandle> {
+        return {
+          id: 'silent-1',
+          runner: 'silent',
+          startedAt: new Date().toISOString(),
+          cancel: async () => {},
+        }
+      },
+      async *stream(_handle: RunHandle) {
+        // Block until killed - never yields. The stuck-timeout should fire.
+        await new Promise<void>(() => {})
+      },
+      async intervene(h, m) {
+        await interveneFn(h, m)
+      },
+      async kill() {},
+    }
+    const memory = fakeMemory()
+
+    const outcome = await orchestrate('fix the bug in src/foo.ts', {
+      runner,
+      memory,
+      patterns: [hermesBugFix],
+      stuckTimeoutMs: 20,
+      maxInterventions: 2,
+    })
+
+    // After 2 stuck-timeouts the next one escalates to kill.
+    expect(interveneFn).toHaveBeenCalledTimes(2)
+    expect(outcome.status).toBe('aborted')
+    expect(outcome.summary).toMatch(/killed by supervisor/)
+    expect(outcome.interventions.length).toBe(3)
+    expect(outcome.interventions.at(-1)?.message).toBe('kill')
+  })
+
+  it('PR3: maxInterventions cap escalates a verdict-driven intervene to kill', async () => {
+    const interveneFn = vi.fn(async () => {})
+    const killFn = vi.fn(async () => {})
+    // Three loops in a row, each crossing the threshold (buffer resets after each fire).
+    const dup = 'same answer'
+    const runner = fakeRunner(
+      [
+        { type: 'message', role: 'assistant', content: dup },
+        { type: 'message', role: 'assistant', content: dup },
+        { type: 'message', role: 'assistant', content: dup },
+        { type: 'message', role: 'assistant', content: dup },
+        { type: 'message', role: 'assistant', content: dup },
+        { type: 'message', role: 'assistant', content: dup },
+      ],
+      { intervene: interveneFn, kill: killFn },
+    )
+    const memory = fakeMemory()
+
+    const outcome = await orchestrate('fix the bug in src/foo.ts', {
+      runner,
+      memory,
+      patterns: [hermesBugFix],
+      stuckTimeoutMs: 0,
+      maxInterventions: 1, // first verdict allowed, second escalates to kill
+    })
+
+    expect(interveneFn).toHaveBeenCalledTimes(1)
+    expect(killFn).toHaveBeenCalled()
+    expect(outcome.status).toBe('aborted')
+    expect(outcome.interventions.at(-1)?.message).toBe('kill')
   })
 })

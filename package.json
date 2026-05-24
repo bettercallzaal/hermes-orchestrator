@@ -1,6 +1,6 @@
 {
   "name": "hermes-orchestrator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Supervisor framework for AI agents - classify, spawn, watch, intervene, learn. The Hermes pattern (Claude CLI subprocess) generalised.",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,6 +17,10 @@
     "./adapters/bonfire-memory": {
       "types": "./dist/adapters/bonfire-memory.d.ts",
       "import": "./dist/adapters/bonfire-memory.js"
+    },
+    "./adapters/file-memory": {
+      "types": "./dist/adapters/file-memory.d.ts",
+      "import": "./dist/adapters/file-memory.js"
     },
     "./patterns/hermes-bug-fix": {
       "types": "./dist/patterns/hermes-bug-fix.d.ts",

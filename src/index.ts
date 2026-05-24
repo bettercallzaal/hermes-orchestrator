@@ -1,9 +1,10 @@
-// Public exports for hermes-orchestrator v0.1.0
-export { orchestrate, _resetQueue } from './orchestrator.js'
+// Public exports for hermes-orchestrator
+export { orchestrate, _resetQueue, type SupervisorVerdict } from './orchestrator.js'
 export { classify } from './router.js'
 export { gate, defaultPolicy } from './autonomy.js'
 export { Learner } from './learner.js'
 export { JobQueue } from './queue.js'
+export { watch, type SupervisorOptions } from './supervisor.js'
 
 // Default adapters - import directly from the adapter path for clarity:
 //   import { HermesRunner } from 'hermes-orchestrator/adapters/hermes-runner'

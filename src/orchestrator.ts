@@ -2,6 +2,7 @@ import { classify } from './router.js'
 import { gate, defaultPolicy } from './autonomy.js'
 import { Learner } from './learner.js'
 import { JobQueue } from './queue.js'
+import { watch, type SupervisorVerdict } from './supervisor.js'
 import type {
   OrchestrateOptions,
   Outcome,
@@ -25,8 +26,7 @@ function toTask(input: string | Task): Task {
 }
 
 // Module-level queue so the concurrency cap is shared across orchestrate() calls
-// within a single process. Operators wanting per-context queues can re-import a
-// fresh module or wrap orchestrate() in their own queue.
+// within a single process.
 let sharedQueue: JobQueue | undefined
 let sharedQueueLimit: number | undefined
 
@@ -53,6 +53,7 @@ export async function orchestrate(
   const queue = getQueue(opts.concurrency ?? 1)
   const release = await queue.acquire()
   const startedAt = Date.now()
+  const interventions: Intervention[] = []
 
   const recordEvent = async (
     kind: OrchestratorEvent['kind'],
@@ -92,7 +93,7 @@ export async function orchestrate(
         status: 'awaiting-confirm',
         durationMs: Date.now() - startedAt,
         costUsd: 0,
-        interventions: [],
+        interventions,
         summary: `No pattern matched. Operator needs to classify: "${task.text.slice(0, 120)}".`,
       }
     }
@@ -128,7 +129,7 @@ export async function orchestrate(
         status: 'aborted',
         durationMs: Date.now() - startedAt,
         costUsd: 0,
-        interventions: [],
+        interventions,
         summary: `Autonomy gate REFUSED spawn: ${spawnDecision.reason}`,
       }
     }
@@ -140,7 +141,7 @@ export async function orchestrate(
         status: 'awaiting-confirm',
         durationMs: Date.now() - startedAt,
         costUsd: 0,
-        interventions: [],
+        interventions,
         summary: `Autonomy gate requires operator CONFIRM: ${spawnDecision.reason}`,
       }
     }
@@ -160,11 +161,20 @@ export async function orchestrate(
     })
     await opts.channels?.status(`task ${task.id} spawned via ${opts.runner.name}`)
 
-    // 6. Drain the stream. PR1 is monitor-only (no real supervisor yet, no intervention).
+    // 6. Drain the supervised stream.
+    // PR2: supervisor verdicts are LOGGED (intervened with acted=false) but not acted on.
+    // PR3: will call opts.runner.intervene() with the suggestedMessage when verdict.kind === 'intervene'.
     let costUsd = 0
     let summary = ''
+    let killed = false
+    let killReason: string | undefined
     const events: RunEvent[] = []
-    for await (const event of opts.runner.stream(handle)) {
+    const supervised = watch(opts.runner.stream(handle), {
+      costCapUsd: runnerInput.maxCostUsd,
+      allowedTools: runnerInput.allowedTools,
+    })
+
+    for await (const { event, verdict } of supervised) {
       events.push(event)
       await opts.channels?.firehose(event)
       if (event.type === 'cost') costUsd = Math.max(costUsd, event.usd)
@@ -172,14 +182,56 @@ export async function orchestrate(
         summary = event.summary
         if (event.costUsd) costUsd = Math.max(costUsd, event.costUsd)
       }
-      if (event.type === 'error') {
-        summary = `error: ${event.message}`
+      if (event.type === 'error') summary = `error: ${event.message}`
+
+      if (verdict.kind === 'intervene') {
+        const step = interventions.length + 1
+        const intervention: Intervention = {
+          step,
+          reason: verdict.reason,
+          message: verdict.suggestedMessage,
+          occurredAt: new Date().toISOString(),
+        }
+        interventions.push(intervention)
+        await recordEvent('intervened', {
+          step,
+          reason: verdict.reason,
+          message: verdict.suggestedMessage,
+          acted: false, // PR2 limit: log only. PR3 will set true and actually intervene.
+        })
+        await opts.channels?.status(
+          `task ${task.id} supervisor verdict #${step}: ${verdict.reason}`,
+        )
+      } else if (verdict.kind === 'kill') {
+        killed = true
+        killReason = verdict.reason
+        const step = interventions.length + 1
+        interventions.push({
+          step,
+          reason: verdict.reason,
+          message: 'kill',
+          occurredAt: new Date().toISOString(),
+        })
+        await recordEvent('intervened', {
+          step,
+          reason: verdict.reason,
+          message: 'kill',
+          acted: true,
+        })
+        await opts.runner.kill(handle).catch(() => {
+          /* best-effort */
+        })
+        await opts.channels?.status(`task ${task.id} KILLED by supervisor: ${verdict.reason}`)
+        break
       }
     }
 
     // 7. Record completion
-    const status: Outcome['status'] = summary.startsWith('error:') ? 'failed' : 'completed'
-    const interventions: Intervention[] = [] // PR1: no real interventions yet (PR3 adds them)
+    const status: Outcome['status'] = killed
+      ? 'aborted'
+      : summary.startsWith('error:')
+        ? 'failed'
+        : 'completed'
     const outcome: Outcome = {
       taskId: task.id,
       pattern: decision.pattern,
@@ -188,7 +240,7 @@ export async function orchestrate(
       durationMs: Date.now() - startedAt,
       costUsd,
       interventions,
-      summary: summary || 'no summary',
+      summary: killed ? `killed by supervisor: ${killReason}` : summary || 'no summary',
       events,
     }
 
@@ -198,9 +250,10 @@ export async function orchestrate(
       durationMs: outcome.durationMs,
       costUsd: outcome.costUsd,
       summary: outcome.summary,
+      interventions: interventions.length,
     })
     await opts.channels?.status(
-      `task ${task.id} ${status} via ${decision.pattern}, ${outcome.durationMs}ms, $${costUsd.toFixed(3)}`,
+      `task ${task.id} ${status} via ${decision.pattern}, ${outcome.durationMs}ms, $${costUsd.toFixed(3)}, interventions=${interventions.length}`,
     )
 
     return outcome
@@ -208,3 +261,5 @@ export async function orchestrate(
     release()
   }
 }
+
+export type { SupervisorVerdict }

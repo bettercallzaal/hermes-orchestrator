@@ -108,6 +108,18 @@ export interface OrchestrateOptions {
   costCap?: number
   concurrency?: number
   classifier?: (task: Task) => Promise<RouterDecision>
+  /**
+   * If the runner emits no event for this many ms, the orchestrator treats it
+   * as a stuck signal and asks the runner to intervene with a nudge.
+   * Default: 60_000. Set to 0 to disable.
+   */
+  stuckTimeoutMs?: number
+  /**
+   * Hard cap on supervisor interventions per task. After this many, the next
+   * verdict that would intervene escalates to kill instead.
+   * Default: 3.
+   */
+  maxInterventions?: number
 }
 
 export interface Intervention {

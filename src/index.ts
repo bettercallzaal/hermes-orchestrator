@@ -15,6 +15,8 @@ export { HermesRunner, type HermesRunnerOptions } from './adapters/hermes-runner
 export { BonfireMemory, type BonfireMemoryOptions } from './adapters/bonfire-memory.js'
 export { FileMemory, type FileMemoryOptions } from './adapters/file-memory.js'
 export { hermesBugFix } from './patterns/hermes-bug-fix.js'
+export { researchDoc } from './patterns/research-doc.js'
+export { meetingCapture } from './patterns/meeting-capture.js'
 
 export type {
   Task,

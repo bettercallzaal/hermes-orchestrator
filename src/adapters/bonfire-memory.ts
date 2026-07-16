@@ -17,8 +17,70 @@ export interface BonfireMemoryOptions {
 const SECRET_RE =
   /sk-ant-[A-Za-z0-9_-]{20,}|sk-(proj-|cp-)?[A-Za-z0-9_-]{30,}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,}|-----BEGIN ([A-Z]+ )?PRIVATE KEY-----|0x[0-9a-fA-F]{64}|[0-9]{9,12}:[A-Za-z0-9_-]{30,}|xox[bpaors]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}/
 
+// PII patterns - emails, phones (skip on match, best-effort like secrets).
+// Per .claude/rules/pii-hygiene.md, allowlists applied.
+// eslint-disable-next-line no-useless-escape
+const PII_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/
+const PII_PHONE_US_RE = /\+?1?\s*\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/
+const PII_PHONE_INTL_RE = /\+\d{1,3}[\s.-]*\d[\d\s.-]{5,}/
+
+// Allowlisted emails (public ZAO addresses) - may appear in episodes
+const ALLOWLISTED_EMAILS = new Set([
+  'zaal@thezao.com',
+  'zaalp99@gmail.com',
+  'zaal@bettercallzaal.com',
+  'zoe-zao@agentmail.to',
+  'hello@thezao.com',
+  'support@thezao.com',
+])
+
+// Allowlisted Telegram handles (public ZAO bots) - may appear in episodes
+const ALLOWLISTED_TG_HANDLES = new Set([
+  '@zaoclaw_bot',
+  '@zoe_hermes_bot',
+  '@zaodevz_bot',
+  '@zabal_bonfire',
+  '@ZAOstockTeamBot',
+  '@ZAOcoworkingBot',
+])
+
 function containsSecret(text: string): boolean {
   return SECRET_RE.test(text)
+}
+
+function containsPII(text: string): boolean {
+  // Check emails: pass if all matches are allowlisted
+  const emailMatches = text.match(PII_EMAIL_RE)
+  if (emailMatches) {
+    for (const email of emailMatches) {
+      if (!ALLOWLISTED_EMAILS.has(email)) {
+        return true
+      }
+    }
+  }
+
+  // Check US phone numbers
+  if (PII_PHONE_US_RE.test(text)) {
+    return true
+  }
+
+  // Check international phone numbers
+  if (PII_PHONE_INTL_RE.test(text)) {
+    return true
+  }
+
+  // Check Telegram handles: pass if all matches are allowlisted.
+  // Use matchAll to get captures and extract just the handle part (group 1).
+  const tgRegex = /(?:^|\s)(@\w+)(?!\.[A-Za-z])/gm
+  let tgMatch: RegExpExecArray | null
+  while ((tgMatch = tgRegex.exec(text)) !== null) {
+    const handle = tgMatch[1]
+    if (!ALLOWLISTED_TG_HANDLES.has(handle)) {
+      return true
+    }
+  }
+
+  return false
 }
 
 function eventToEpisode(
@@ -54,7 +116,8 @@ function eventToEpisode(
 
 /**
  * Default MemoryAdapter. Writes orchestrator events as episodes to a Bonfire KG.
- * Best-effort: never throws. Bodies are secret-scanned locally before any POST.
+ * Best-effort: never throws. Bodies are secret-scanned and PII-scanned locally before any POST.
+ * Episodes matching secret or PII patterns are skipped (never POSTed).
  *
  * Caveat: vector_store/search returns [] until an admin runs labeling on the
  * Bonfire. Until then, retrieve() returns []. The code path is live - no change
@@ -75,6 +138,12 @@ export class BonfireMemory implements MemoryAdapter {
     if (containsSecret(episode.body)) {
       console.warn(
         `[bonfire-memory] SKIP episode ${episode.name} - body matched secret pattern (never POSTed)`,
+      )
+      return
+    }
+    if (containsPII(episode.body)) {
+      console.warn(
+        `[bonfire-memory] SKIP episode ${episode.name} - body matched PII pattern (never POSTed)`,
       )
       return
     }

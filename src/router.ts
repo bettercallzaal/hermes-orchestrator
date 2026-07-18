@@ -13,13 +13,21 @@ const defaultClassifier = async (
   patterns: PatternAdapter[],
 ): Promise<RouterDecision> => {
   for (const pattern of patterns) {
-    if (pattern.matches(task)) {
-      return {
-        pattern: pattern.name,
-        runner: pattern.defaultRunner ?? 'hermes',
-        confidence: 0.6,
-        reasoning: `Heuristic match: pattern '${pattern.name}' returned true for task.`,
+    try {
+      if (pattern.matches(task)) {
+        return {
+          pattern: pattern.name,
+          runner: pattern.defaultRunner ?? 'hermes',
+          confidence: 0.6,
+          reasoning: `Heuristic match: pattern '${pattern.name}' returned true for task.`,
+        }
       }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(
+        `[router] pattern '${pattern.name}' matches() threw: ${msg}`,
+      )
+      // Continue to next pattern; skip this one
     }
   }
   return {

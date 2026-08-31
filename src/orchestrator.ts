@@ -257,6 +257,22 @@ export async function orchestrate(
     )
 
     return outcome
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err)
+    await recordEvent('failed', {
+      reason: 'internal-error',
+      detail: errorMsg,
+    })
+    return {
+      taskId: task.id,
+      pattern: 'unknown',
+      runner: opts.runner.name,
+      status: 'failed',
+      durationMs: Date.now() - startedAt,
+      costUsd: 0,
+      interventions,
+      summary: `Internal error: ${errorMsg}`,
+    }
   } finally {
     release()
   }

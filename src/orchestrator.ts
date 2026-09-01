@@ -44,6 +44,9 @@ export function _resetQueue(): void {
   sharedQueueLimit = undefined
 }
 
+const DEFAULT_STUCK_TIMEOUT_MS = 60_000
+const DEFAULT_MAX_INTERVENTIONS = 3
+
 export async function orchestrate(
   input: string | Task,
   opts: OrchestrateOptions,
@@ -54,6 +57,8 @@ export async function orchestrate(
   const release = await queue.acquire()
   const startedAt = Date.now()
   const interventions: Intervention[] = []
+  const stuckTimeoutMs = opts.stuckTimeoutMs ?? DEFAULT_STUCK_TIMEOUT_MS
+  const maxInterventions = opts.maxInterventions ?? DEFAULT_MAX_INTERVENTIONS
 
   const recordEvent = async (
     kind: OrchestratorEvent['kind'],
@@ -146,7 +151,7 @@ export async function orchestrate(
       }
     }
 
-    // 4. Retrieve past memory (no-op until Bonfire labeling unlocks, but interface is live)
+    // 4. Retrieve past memory (no-op until Bonfire labeling unlocks)
     const past = await learner.retrieve(decision.pattern, decision.pattern, 5)
 
     // 5. Prepare + spawn
@@ -161,9 +166,11 @@ export async function orchestrate(
     })
     await opts.channels?.status(`task ${task.id} spawned via ${opts.runner.name}`)
 
-    // 6. Drain the supervised stream.
-    // PR2: supervisor verdicts are LOGGED (intervened with acted=false) but not acted on.
-    // PR3: will call opts.runner.intervene() with the suggestedMessage when verdict.kind === 'intervene'.
+    // 6. Drain the supervised stream with stuck-timeout race + real intervention.
+    // PR3 changes vs PR2:
+    //   - iterator races against a stuck-timeout (Promise.race)
+    //   - intervene verdicts call runner.intervene() for real (acted=true)
+    //   - maxInterventions cap escalates the (N+1)th intervene-or-stuck to a kill
     let costUsd = 0
     let summary = ''
     let killed = false
@@ -173,8 +180,93 @@ export async function orchestrate(
       costCapUsd: runnerInput.maxCostUsd,
       allowedTools: runnerInput.allowedTools,
     })
+    const iter = supervised[Symbol.asyncIterator]()
 
-    for await (const { event, verdict } of supervised) {
+    const recordIntervention = async (
+      reason: string,
+      message: string,
+      acted: boolean,
+    ): Promise<number> => {
+      const step = interventions.length + 1
+      interventions.push({
+        step,
+        reason,
+        message,
+        occurredAt: new Date().toISOString(),
+      })
+      await recordEvent('intervened', { step, reason, message, acted })
+      await opts.channels?.status(
+        `task ${task.id} intervention #${step}: ${reason}`,
+      )
+      return step
+    }
+
+    while (true) {
+      type Step =
+        | { kind: 'event'; value: { event: RunEvent; verdict: SupervisorVerdict } }
+        | { kind: 'done' }
+        | { kind: 'stuck' }
+
+      const next: Step = await (async (): Promise<Step> => {
+        if (stuckTimeoutMs <= 0) {
+          const r = await iter.next()
+          return r.done ? { kind: 'done' } : { kind: 'event', value: r.value }
+        }
+        return new Promise<Step>((resolve) => {
+          let settled = false
+          const timer = setTimeout(() => {
+            if (!settled) {
+              settled = true
+              resolve({ kind: 'stuck' })
+            }
+          }, stuckTimeoutMs)
+          iter.next().then(
+            (r) => {
+              if (settled) return
+              settled = true
+              clearTimeout(timer)
+              resolve(r.done ? { kind: 'done' } : { kind: 'event', value: r.value })
+            },
+            (err: unknown) => {
+              if (settled) return
+              settled = true
+              clearTimeout(timer)
+              const msg = err instanceof Error ? err.message : String(err)
+              resolve({
+                kind: 'event',
+                value: {
+                  event: { type: 'error', message: msg },
+                  verdict: { kind: 'continue' },
+                },
+              })
+            },
+          )
+        })
+      })()
+
+      if (next.kind === 'done') break
+
+      if (next.kind === 'stuck') {
+        if (interventions.length >= maxInterventions) {
+          killed = true
+          killReason = `stuck timeout (${stuckTimeoutMs}ms) and max interventions (${maxInterventions}) reached`
+          await recordIntervention(killReason, 'kill', true)
+          await opts.runner.kill(handle).catch(() => {
+            /* best-effort */
+          })
+          break
+        }
+        const stuckMsg = `Supervisor: no events for ${stuckTimeoutMs}ms. Are you stuck? Summarise the step you are on and what you have tried.`
+        await recordIntervention('stuck-timeout', stuckMsg, true)
+        await opts.runner.intervene(handle, stuckMsg).catch((err: unknown) => {
+          console.warn(
+            `[orchestrator] runner.intervene threw: ${err instanceof Error ? err.message : String(err)}`,
+          )
+        })
+        continue
+      }
+
+      const { event, verdict } = next.value
       events.push(event)
       await opts.channels?.firehose(event)
       if (event.type === 'cost') costUsd = Math.max(costUsd, event.usd)
@@ -185,43 +277,29 @@ export async function orchestrate(
       if (event.type === 'error') summary = `error: ${event.message}`
 
       if (verdict.kind === 'intervene') {
-        const step = interventions.length + 1
-        const intervention: Intervention = {
-          step,
-          reason: verdict.reason,
-          message: verdict.suggestedMessage,
-          occurredAt: new Date().toISOString(),
+        if (interventions.length >= maxInterventions) {
+          // Escalate to kill - we've already nudged enough.
+          killed = true
+          killReason = `max interventions (${maxInterventions}) reached after: ${verdict.reason}`
+          await recordIntervention(killReason, 'kill', true)
+          await opts.runner.kill(handle).catch(() => {
+            /* best-effort */
+          })
+          break
         }
-        interventions.push(intervention)
-        await recordEvent('intervened', {
-          step,
-          reason: verdict.reason,
-          message: verdict.suggestedMessage,
-          acted: false, // PR2 limit: log only. PR3 will set true and actually intervene.
+        await recordIntervention(verdict.reason, verdict.suggestedMessage, true)
+        await opts.runner.intervene(handle, verdict.suggestedMessage).catch((err: unknown) => {
+          console.warn(
+            `[orchestrator] runner.intervene threw: ${err instanceof Error ? err.message : String(err)}`,
+          )
         })
-        await opts.channels?.status(
-          `task ${task.id} supervisor verdict #${step}: ${verdict.reason}`,
-        )
       } else if (verdict.kind === 'kill') {
         killed = true
         killReason = verdict.reason
-        const step = interventions.length + 1
-        interventions.push({
-          step,
-          reason: verdict.reason,
-          message: 'kill',
-          occurredAt: new Date().toISOString(),
-        })
-        await recordEvent('intervened', {
-          step,
-          reason: verdict.reason,
-          message: 'kill',
-          acted: true,
-        })
+        await recordIntervention(verdict.reason, 'kill', true)
         await opts.runner.kill(handle).catch(() => {
           /* best-effort */
         })
-        await opts.channels?.status(`task ${task.id} KILLED by supervisor: ${verdict.reason}`)
         break
       }
     }

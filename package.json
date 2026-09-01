@@ -1,6 +1,6 @@
 {
   "name": "hermes-orchestrator",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Supervisor framework for AI agents - classify, spawn, watch, intervene, learn. The Hermes pattern (Claude CLI subprocess) generalised.",
   "type": "module",
   "main": "./dist/index.js",

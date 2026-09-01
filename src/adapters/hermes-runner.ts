@@ -15,9 +15,23 @@ export interface HermesRunnerOptions {
 
 interface ActiveRun {
   proc: ChildProcess
+  /** Captured from the first system/init line of stream-json. Needed by intervene to resume. */
+  sessionId?: string
+  /** Cached spawn config so intervene can re-spawn with the same systemPrompt + tool whitelist. */
+  spawnConfig: {
+    args: string[]
+    cwd: string
+    env: NodeJS.ProcessEnv
+    bin: string
+  }
   startedAt: string
   output: string[]
+  /** Final-closed: the stream() generator may exit. */
   closed: boolean
+  /** True between killing the old proc and attaching the new one in intervene(). */
+  swapping: boolean
+  /** How many intervene() swaps have happened so far. Surfaced in logs. */
+  interventionCount: number
 }
 
 /**
@@ -26,6 +40,12 @@ interface ActiveRun {
  *
  * Auth via Claude Code Max plan OAuth (`claude /login` once) - no API key
  * needed in env, no per-call billing.
+ *
+ * Intervention (added in PR3): the runner captures the session_id from the
+ * first system/init line, and on intervene() kills the live process and
+ * spawns a fresh `claude --resume <session_id> <message>` with the same
+ * systemPrompt + tool whitelist. The orchestrator's stream loop transparently
+ * continues - the new process appends to the same output buffer.
  */
 export class HermesRunner implements RunnerAdapter {
   readonly name = 'hermes'
@@ -35,49 +55,29 @@ export class HermesRunner implements RunnerAdapter {
 
   async spawn(input: RunnerInput): Promise<RunHandle> {
     const id = `hermes-${randomUUID().slice(0, 8)}`
-    const args: string[] = [
-      '--print',
-      '--output-format',
-      'stream-json',
-      '--verbose',
-    ]
-    if (input.systemPrompt) {
-      args.push('--append-system-prompt', input.systemPrompt)
-    }
-    if (input.allowedTools && input.allowedTools.length > 0) {
-      args.push('--allowedTools', input.allowedTools.join(','))
-    }
-    if (input.disallowedTools && input.disallowedTools.length > 0) {
-      args.push('--disallowedTools', input.disallowedTools.join(','))
-    }
-    if (this.opts.extraArgs && this.opts.extraArgs.length > 0) {
-      args.push(...this.opts.extraArgs)
-    }
-    args.push(input.prompt)
+    const args = this.buildArgs(input, undefined)
+    const cwd = input.workDir ?? this.opts.workDir ?? process.cwd()
+    const env = { ...process.env, ...this.opts.env }
+    const bin = this.opts.claudeBin ?? 'claude'
 
-    const proc = spawnProcess(this.opts.claudeBin ?? 'claude', args, {
-      cwd: input.workDir ?? this.opts.workDir ?? process.cwd(),
-      env: { ...process.env, ...this.opts.env },
+    const proc = spawnProcess(bin, [...args, input.prompt], {
+      cwd,
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 
     const startedAt = new Date().toISOString()
-    const run: ActiveRun = { proc, startedAt, output: [], closed: false }
+    const run: ActiveRun = {
+      proc,
+      startedAt,
+      output: [],
+      closed: false,
+      swapping: false,
+      interventionCount: 0,
+      spawnConfig: { args, cwd, env, bin },
+    }
     this.runs.set(id, run)
-
-    proc.stdout?.setEncoding('utf8').on('data', (chunk: string) => {
-      run.output.push(chunk)
-    })
-    proc.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
-      run.output.push(chunk)
-    })
-    proc.on('close', () => {
-      run.closed = true
-    })
-    proc.on('error', (err) => {
-      run.output.push(JSON.stringify({ type: 'error', message: err.message }) + '\n')
-      run.closed = true
-    })
+    this.wireProcess(run, proc)
 
     return {
       id,
@@ -130,21 +130,92 @@ export class HermesRunner implements RunnerAdapter {
     yield { type: 'complete', summary: '' } // sentinel; orchestrator uses the prior complete summary
   }
 
-  async intervene(_handle: RunHandle, message: string): Promise<void> {
-    // PR1 limitation: claude --print does not accept mid-run stdin for interventions.
-    // PR3 will add this when we switch to a session-based runner (claude --session).
-    console.warn(
-      `[hermes-runner] intervene() called but not supported in --print mode. PR3 adds session support. Message: ${message.slice(0, 80)}`,
-    )
+  async intervene(handle: RunHandle, message: string): Promise<void> {
+    const run = this.runs.get(handle.id)
+    if (!run) return
+    if (!run.sessionId) {
+      // Session id not yet observed - the init line hasn't been parsed.
+      // Best-effort: log and skip. Next intervention will likely succeed.
+      console.warn(
+        `[hermes-runner] intervene called before session_id was captured; skipping. message=${message.slice(0, 80)}`,
+      )
+      return
+    }
+    if (run.closed) {
+      console.warn('[hermes-runner] intervene called on already-closed run; skipping')
+      return
+    }
+
+    run.swapping = true
+    run.interventionCount += 1
+    const oldProc = run.proc
+
+    // Kill old and wait for it to truly close so its 'close' handler fires while swapping=true.
+    const closed = new Promise<void>((resolve) => {
+      oldProc.once('close', () => resolve())
+    })
+    oldProc.kill('SIGTERM')
+    const killTimeout = setTimeout(() => oldProc.kill('SIGKILL'), 5_000)
+    await closed
+    clearTimeout(killTimeout)
+
+    // Spawn the resume process with the SAME flags + the intervention message as the new prompt.
+    const { args, cwd, env, bin } = run.spawnConfig
+    const resumeArgs = ['--resume', run.sessionId, ...args, message]
+    const newProc = spawnProcess(bin, resumeArgs, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    run.proc = newProc
+    this.wireProcess(run, newProc)
+    run.swapping = false
   }
 
   async kill(handle: RunHandle): Promise<void> {
     const run = this.runs.get(handle.id)
     if (!run || run.closed) return
+    // Set swapping=false so the close handler will mark closed.
+    run.swapping = false
     run.proc.kill('SIGTERM')
     setTimeout(() => {
       if (!run.closed) run.proc.kill('SIGKILL')
     }, 5000)
+  }
+
+  private buildArgs(input: RunnerInput, _existingSessionId: string | undefined): string[] {
+    const args: string[] = ['--print', '--output-format', 'stream-json', '--verbose']
+    if (input.systemPrompt) {
+      args.push('--append-system-prompt', input.systemPrompt)
+    }
+    if (input.allowedTools && input.allowedTools.length > 0) {
+      args.push('--allowedTools', input.allowedTools.join(','))
+    }
+    if (input.disallowedTools && input.disallowedTools.length > 0) {
+      args.push('--disallowedTools', input.disallowedTools.join(','))
+    }
+    if (this.opts.extraArgs && this.opts.extraArgs.length > 0) {
+      args.push(...this.opts.extraArgs)
+    }
+    return args
+  }
+
+  /** Attach stdio/close/error handlers to a (re-)spawned proc. Captures session_id once. */
+  private wireProcess(run: ActiveRun, proc: ChildProcess): void {
+    proc.stdout?.setEncoding('utf8').on('data', (chunk: string) => {
+      run.output.push(chunk)
+      if (!run.sessionId) {
+        const m = chunk.match(/"session_id"\s*:\s*"([^"]+)"/)
+        if (m) run.sessionId = m[1]
+      }
+    })
+    proc.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
+      run.output.push(chunk)
+    })
+    proc.on('close', () => {
+      // Only finalise the run if we are NOT in the middle of an intervene swap.
+      if (!run.swapping) run.closed = true
+    })
+    proc.on('error', (err) => {
+      run.output.push(JSON.stringify({ type: 'error', message: err.message }) + '\n')
+      if (!run.swapping) run.closed = true
+    })
   }
 }
 

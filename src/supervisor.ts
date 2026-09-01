@@ -93,6 +93,10 @@ function decide(event: RunEvent, state: State, ctx: DecideContext): SupervisorVe
       state.recentAssistantMessages.length === ctx.loopThreshold &&
       state.recentAssistantMessages.every((m) => m === state.recentAssistantMessages[0])
     ) {
+      // Reset the window so the next identical message does not double-fire.
+      // The orchestrator will have intervened by then; the resumed session may
+      // still loop, in which case the next 3 identicals legitimately re-trigger.
+      state.recentAssistantMessages = []
       return {
         kind: 'intervene',
         reason: `loop detected: same assistant message repeated ${ctx.loopThreshold}x`,
